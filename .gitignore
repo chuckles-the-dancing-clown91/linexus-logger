@@ -1,1 +1,6 @@
 target/
+
+# local audit databases
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
