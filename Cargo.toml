@@ -17,3 +17,6 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
+axum = { version = "0.8" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+anyhow = "1"
