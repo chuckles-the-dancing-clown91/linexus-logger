@@ -1,0 +1,147 @@
+# Release contract v1 (docs/operations/releases.md in daedalus-it): every push
+# to the default branch, and every manual run, publishes a GitHub Release once
+# the tests pass. Version YYYY.MM.DD.<run number> (UTC), tag v<version>.
+#
+# Settings on this repository:
+#   secret RELEASE_SIGNING_KEY  Ed25519 private key, PEM (scripts/release/keygen.sh
+#                               in daedalus-it). Without it the release is unsigned.
+#   nothing else: GITHUB_TOKEN publishes the release
+#   and pushes ghcr.io/chuckles-the-dancing-clown91/linexus-logger:<version> and :latest (packages: write).
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo test
+        run: cargo test
+
+  release:
+    name: Build, sign and publish
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      packages: write
+    # One release at a time: two pushes never race for a version or a tag. A
+    # waiting run is replaced by a newer one, which releases a later commit.
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      PRODUCT: linexus-logger
+      IMAGE: ghcr.io/chuckles-the-dancing-clown91/linexus-logger
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0 # every commit and tag: the notes need them
+
+      - name: Version and notes
+        id: v
+        run: |
+          set -euo pipefail
+          if scripts/release/manifest.sh superseded "$GITHUB_EVENT_NAME"; then
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version=$(scripts/release/manifest.sh version)
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "::error::tag v$version already exists"
+            exit 1
+          fi
+          prev=$(scripts/release/manifest.sh prev-tag)
+          scripts/release/manifest.sh notes "$prev" >"$RUNNER_TEMP/notes.md"
+          {
+            echo "VERSION=$version"
+            echo "DIST=$RUNNER_TEMP/dist"
+            echo "STAGE=$RUNNER_TEMP/stage"
+          } >>"$GITHUB_ENV"
+          echo "version $version (previous release: ${prev:-none})"
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        if: steps.v.outputs.skip != 'true'
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.v.outputs.skip != 'true'
+
+      - name: Build the logger binary
+        if: steps.v.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          cargo build --release --target x86_64-unknown-linux-gnu --bin linexus-logger
+          mkdir -p "$DIST" "$STAGE/logger"
+          install -m 755 target/x86_64-unknown-linux-gnu/release/linexus-logger "$STAGE/logger/linexus-logger"
+          scripts/release/manifest.sh pack "$DIST/$PRODUCT-logger-$VERSION-linux-amd64.tar.gz" "$STAGE/logger"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        if: steps.v.outputs.skip != 'true'
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        if: steps.v.outputs.skip != 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push the image
+        id: image
+        if: steps.v.outputs.skip != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+
+      - name: release.json, SHA256SUMS and signature
+        if: steps.v.outputs.skip != 'true'
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          scripts/release/manifest.sh write "$DIST" \
+            --product "$PRODUCT" --version "$VERSION" --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" \
+            --notes-file "$RUNNER_TEMP/notes.md" --migrations false \
+            "binary:logger:$PRODUCT-logger-$VERSION-linux-amd64.tar.gz:linux:amd64" \
+            "image:logger-image:$IMAGE:$VERSION:$IMAGE_DIGEST"
+          scripts/release/manifest.sh sums "$DIST"
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY is not set: publishing an unsigned release"
+          fi
+          cat "$DIST/release.json" "$DIST/SHA256SUMS"
+
+      - name: Publish
+        if: steps.v.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" "$DIST"/* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$PRODUCT $VERSION" --notes-file "$RUNNER_TEMP/notes.md" --latest
+          echo "Published [$PRODUCT $VERSION]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v$VERSION)" >>"$GITHUB_STEP_SUMMARY"
