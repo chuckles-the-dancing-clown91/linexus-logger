@@ -19,8 +19,10 @@ impl SegmentedLog {
 
     pub fn append(&self, entry: LedgerEntry) {
         let mut segments = self.segments.lock().unwrap();
-        if let Some(current) = segments.last_mut() {
-            if current.append(entry.clone()) { return; }
+        if let Some(current) = segments.last_mut()
+            && current.append(entry.clone())
+        {
+            return;
         }
         let mut next_id = self.next_segment_id.lock().unwrap();
         let mut new_segment = LogSegment::new(*next_id, self.entries_per_segment);
