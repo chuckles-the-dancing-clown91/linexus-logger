@@ -11,8 +11,8 @@
 //! (`{timestamp, level, source, message}`) is a straight field selection.
 
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
 
 /// One stored operational event.
@@ -71,9 +71,7 @@ impl IngestEntry {
     /// Materialize into a stored record, assigning id/timestamp if absent.
     fn into_record(self) -> AuditRecord {
         AuditRecord {
-            id: self
-                .id
-                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+            id: self.id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
             timestamp: self
                 .timestamp
                 .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
@@ -92,11 +90,22 @@ impl IngestEntry {
 pub struct LogQuery {
     pub agent_id: Option<String>,
     pub task_id: Option<String>,
+    /// Exact `level` (`info` | `warn` | `error`).
+    pub level: Option<String>,
+    /// Exact `source`.
+    pub source: Option<String>,
+    /// RFC 3339 lower bound on the event timestamp (inclusive).
+    pub since: Option<String>,
+    /// RFC 3339 upper bound on the event timestamp (inclusive).
+    pub until: Option<String>,
+    /// Paging cursor: the id of the oldest record of the previous page; only
+    /// records ingested before it are returned. An unknown id yields nothing.
+    pub before: Option<String>,
     pub limit: i64,
 }
 
-/// SQLite-backed persistence for operational events. Append-only in practice —
-/// there is no update or delete path.
+/// SQLite-backed persistence for operational events. Append-only, except for
+/// retention: [`AuditStore::prune_older_than`] drops events past their age.
 #[derive(Clone)]
 pub struct AuditStore {
     pool: SqlitePool,
@@ -167,26 +176,72 @@ impl AuditStore {
         Ok(rec)
     }
 
-    /// Persist a batch, returning the materialized records in input order.
+    /// Persist a batch atomically — all of it or none of it, so a rejected
+    /// entry (a duplicate id, say) never leaves half a task's trail behind.
+    /// Returns the materialized records in input order.
     pub async fn ingest_many(&self, entries: Vec<IngestEntry>) -> anyhow::Result<Vec<AuditRecord>> {
+        let mut tx = self.pool.begin().await?;
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
-            out.push(self.ingest(entry).await?);
+            let rec = entry.into_record();
+            let metadata = rec
+                .metadata
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            sqlx::query(
+                "INSERT INTO audit_logs (id, ts, agent_id, task_id, level, source, message, metadata)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.id)
+            .bind(&rec.timestamp)
+            .bind(&rec.agent_id)
+            .bind(&rec.task_id)
+            .bind(&rec.level)
+            .bind(&rec.source)
+            .bind(&rec.message)
+            .bind(&metadata)
+            .execute(&mut *tx)
+            .await?;
+            out.push(rec);
         }
+        tx.commit().await?;
         Ok(out)
     }
 
-    /// Query events most-recent-first, optionally filtered by agent and/or task.
+    /// Delete events older than `days` days, returning how many went. The
+    /// timestamp is compared as a date (`datetime(ts)`), so entries stamped
+    /// with any UTC offset age correctly.
+    pub async fn prune_older_than(&self, days: u32) -> anyhow::Result<u64> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(days))).to_rfc3339();
+        let res = sqlx::query("DELETE FROM audit_logs WHERE datetime(ts) < datetime(?)")
+            .bind(&cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Query events most-recent-first, filtered by whatever `q` constrains.
     pub async fn query(&self, q: &LogQuery) -> anyhow::Result<Vec<AuditRecord>> {
         let mut sql = String::from(
             "SELECT id, ts, agent_id, task_id, level, source, message, metadata FROM audit_logs",
         );
+        // Conditions and their bind values, in order.
         let mut conds: Vec<&str> = Vec::new();
-        if q.agent_id.is_some() {
-            conds.push("agent_id = ?");
-        }
-        if q.task_id.is_some() {
-            conds.push("task_id = ?");
+        let mut binds: Vec<&String> = Vec::new();
+        for (cond, value) in [
+            ("agent_id = ?", &q.agent_id),
+            ("task_id = ?", &q.task_id),
+            ("level = ?", &q.level),
+            ("source = ?", &q.source),
+            ("datetime(ts) >= datetime(?)", &q.since),
+            ("datetime(ts) <= datetime(?)", &q.until),
+            ("seq < (SELECT seq FROM audit_logs WHERE id = ?)", &q.before),
+        ] {
+            if let Some(v) = value {
+                conds.push(cond);
+                binds.push(v);
+            }
         }
         if !conds.is_empty() {
             sql.push_str(" WHERE ");
@@ -195,11 +250,8 @@ impl AuditStore {
         sql.push_str(" ORDER BY seq DESC LIMIT ?");
 
         let mut query = sqlx::query(&sql);
-        if let Some(a) = &q.agent_id {
-            query = query.bind(a);
-        }
-        if let Some(t) = &q.task_id {
-            query = query.bind(t);
+        for v in binds {
+            query = query.bind(v);
         }
         let limit = q.limit.clamp(1, 1000);
         query = query.bind(limit);
@@ -255,8 +307,8 @@ mod tests {
         let a1 = store
             .query(&LogQuery {
                 agent_id: Some("a1".into()),
-                task_id: None,
                 limit: 10,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -266,9 +318,8 @@ mod tests {
 
         let all = store
             .query(&LogQuery {
-                agent_id: None,
-                task_id: None,
                 limit: 10,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -295,12 +346,191 @@ mod tests {
         let got = store
             .query(&LogQuery {
                 agent_id: Some("a1".into()),
-                task_id: None,
                 limit: 3,
+                ..Default::default()
             })
             .await
             .unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].message, "m4");
+    }
+
+    fn stamped(msg: &str, ts: &str, level: &str, source: &str) -> IngestEntry {
+        IngestEntry {
+            timestamp: Some(ts.into()),
+            level: level.into(),
+            source: source.into(),
+            ..entry(msg, Some("a1"))
+        }
+    }
+
+    #[tokio::test]
+    async fn filters_by_level_source_and_time_window() {
+        let store = AuditStore::connect("sqlite::memory:").await.unwrap();
+        store
+            .ingest_many(vec![
+                stamped("old", "2026-01-01T00:00:00Z", "info", "agent"),
+                stamped("mid", "2026-06-01T12:00:00+02:00", "warn", "nexus"),
+                stamped(
+                    "new",
+                    "2026-10-01T00:00:00.123456789+00:00",
+                    "error",
+                    "agent",
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let q = |f: &dyn Fn(&mut LogQuery)| {
+            let mut q = LogQuery {
+                limit: 10,
+                ..Default::default()
+            };
+            f(&mut q);
+            q
+        };
+        let msgs = |recs: Vec<AuditRecord>| recs.into_iter().map(|r| r.message).collect::<Vec<_>>();
+
+        let got = store
+            .query(&q(&|q| q.level = Some("warn".into())))
+            .await
+            .unwrap();
+        assert_eq!(msgs(got), ["mid"]);
+        let got = store
+            .query(&q(&|q| q.source = Some("agent".into())))
+            .await
+            .unwrap();
+        assert_eq!(msgs(got), ["new", "old"]);
+        // `since` is inclusive and offset-aware: 10:00Z is the same instant
+        // as the "mid" entry's 12:00+02:00.
+        let got = store
+            .query(&q(&|q| q.since = Some("2026-06-01T10:00:00Z".into())))
+            .await
+            .unwrap();
+        assert_eq!(msgs(got), ["new", "mid"]);
+        let got = store
+            .query(&q(&|q| {
+                q.since = Some("2026-02-01T00:00:00Z".into());
+                q.until = Some("2026-09-01T00:00:00Z".into());
+            }))
+            .await
+            .unwrap();
+        assert_eq!(msgs(got), ["mid"]);
+        // Nanosecond timestamps (what chrono stamps) compare too.
+        let got = store
+            .query(&q(&|q| q.since = Some("2026-10-01T00:00:00Z".into())))
+            .await
+            .unwrap();
+        assert_eq!(msgs(got), ["new"]);
+    }
+
+    #[tokio::test]
+    async fn pages_with_a_before_cursor() {
+        let store = AuditStore::connect("sqlite::memory:").await.unwrap();
+        for i in 0..5 {
+            store
+                .ingest(entry(&format!("m{i}"), Some("a1")))
+                .await
+                .unwrap();
+        }
+        let page1 = store
+            .query(&LogQuery {
+                limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page1.iter().map(|r| r.message.as_str()).collect::<Vec<_>>(),
+            ["m4", "m3"]
+        );
+        let page2 = store
+            .query(&LogQuery {
+                limit: 2,
+                before: Some(page1[1].id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page2.iter().map(|r| r.message.as_str()).collect::<Vec<_>>(),
+            ["m2", "m1"]
+        );
+        let page3 = store
+            .query(&LogQuery {
+                limit: 2,
+                before: Some(page2[1].id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3[0].message, "m0");
+        // An unknown cursor returns nothing rather than everything.
+        let none = store
+            .query(&LogQuery {
+                limit: 2,
+                before: Some("nope".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_many_is_all_or_nothing() {
+        let store = AuditStore::connect("sqlite::memory:").await.unwrap();
+        let dup = IngestEntry {
+            id: Some("same-id".into()),
+            ..entry("first", None)
+        };
+        let again = IngestEntry {
+            id: Some("same-id".into()),
+            ..entry("second", None)
+        };
+        assert!(
+            store
+                .ingest_many(vec![entry("ok", None), dup, again])
+                .await
+                .is_err()
+        );
+        let all = store
+            .query(&LogQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            all.is_empty(),
+            "a failed batch must leave nothing behind: {all:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_drops_only_old_events() {
+        let store = AuditStore::connect("sqlite::memory:").await.unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+        let recent = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        store
+            .ingest_many(vec![
+                stamped("old", &old, "info", "agent"),
+                stamped("recent", &recent, "info", "agent"),
+                entry("now", None),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(store.prune_older_than(90).await.unwrap(), 1);
+        let left = store
+            .query(&LogQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|r| r.message != "old"));
+        assert_eq!(store.prune_older_than(90).await.unwrap(), 0);
     }
 }
